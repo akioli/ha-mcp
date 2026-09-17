@@ -1610,6 +1610,52 @@ class TestYamlConfirmFlow:
                 mcp_client_with_yaml_config, "ha_reload_core", {"target": "themes"}
             )
 
+    async def test_line_ending_change_invalidates_confirmation(
+        self, mcp_client_with_yaml_config: Any
+    ) -> None:
+        fname = f"themes/confirm_newlines_{uuid.uuid4().hex[:8]}.yaml"
+        original = "Confirmation Probe:\n  marker: unchanged\n"
+        args = {
+            "file": fname,
+            "yaml_path": "Confirmation Probe",
+            "action": "replace",
+            "content": "marker: requested\n",
+        }
+        try:
+            async with MCPAssertions(mcp_client_with_yaml_config) as mcp:
+                await mcp.call_tool_success(
+                    "ha_write_file", {"path": fname, "content": original}
+                )
+                preview = await mcp.call_tool_success(TOOL_NAME, args)
+                changed = original.replace("\n", "\r\n")
+                await mcp.call_tool_success(
+                    "ha_write_file",
+                    {"path": fname, "content": changed, "overwrite": True},
+                )
+                stale = await mcp.call_tool_success(
+                    TOOL_NAME, {**args, "confirm_token": preview["confirm_token"]}
+                )
+                assert stale["written"] is False, stale
+                assert stale["confirm_token_mismatch"] is True, stale
+                assert stale["confirm_token"] != preview["confirm_token"]
+                current = await mcp.call_tool_success(READ_TOOL, {"path": fname})
+                assert current["size"] == len(changed.encode()), current
+                assert current["content"].replace("\r\n", "\n") == original
+                confirmed = await mcp.call_tool_success(
+                    TOOL_NAME, {**args, "confirm_token": stale["confirm_token"]}
+                )
+                assert confirmed["written"] is True, confirmed
+                assert confirmed["config_check"] == "ok", confirmed
+        finally:
+            await safe_call_tool(
+                mcp_client_with_yaml_config,
+                "ha_delete_file",
+                {"path": fname, "confirm": True},
+            )
+            await safe_call_tool(
+                mcp_client_with_yaml_config, "ha_reload_core", {"target": "themes"}
+            )
+
     async def test_wrong_token_re_previews(self, mcp_client_with_yaml_config):
         """A bogus confirm_token re-previews (mismatch flagged) and writes nothing."""
         mcp_client = mcp_client_with_yaml_config

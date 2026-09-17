@@ -1805,7 +1805,9 @@ async def _load_edit_target_data(
     # Read existing file content (or start with empty dict)
     target_exists = await hass.async_add_executor_job(target_file.exists)
     if target_exists:
-        raw_content = await hass.async_add_executor_job(target_file.read_text)
+        raw_content = await hass.async_add_executor_job(
+            lambda: target_file.read_text(newline="")
+        )
         try:
             data = await hass.async_add_executor_job(
                 lambda: make_yaml().load(StringIO(raw_content)) or {}
