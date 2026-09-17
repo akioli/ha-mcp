@@ -16,8 +16,10 @@ Covers both layers of the fix:
 
 import asyncio
 import sys
+from collections.abc import Callable
 from io import StringIO
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from unittest.mock import MagicMock as MM
 
@@ -344,6 +346,59 @@ class TestConfirmFlow:
         assert result["confirm_token_mismatch"] is True
         assert result["confirm_token"] != preview["confirm_token"]
         assert "monthly_bill_ac" not in cfg.read_text()
+
+    @pytest.mark.parametrize("action", ["replace", "remove"])
+    @pytest.mark.parametrize(
+        "intervening_value",
+        ["unchanged # concurrent comment", "concurrent_value"],
+        ids=["comment", "value"],
+    )
+    def test_stale_token_rejects_changes_inside_edited_theme(
+        self,
+        tmp_path: Path,
+        hass: MagicMock,
+        call_factory: Callable[[dict[str, Any]], MagicMock],
+        action: str,
+        intervening_value: str,
+    ) -> None:
+        cfg = tmp_path / "themes" / "confirm.yaml"
+        cfg.parent.mkdir()
+        cfg.write_text("Test Theme:\n  marker: unchanged\n")
+        args = {
+            "file": "themes/confirm.yaml",
+            "action": action,
+            "yaml_path": "Test Theme",
+            "require_confirm": True,
+        }
+        if action == "replace":
+            args["content"] = "marker: requested\n"
+        handler = _build_edit_yaml_config_handler(hass)
+        preview = self._run(handler(call_factory(args)))
+        assert preview["written"] is False
+
+        intervening = f"Test Theme:\n  marker: {intervening_value}\n"
+        cfg.write_text(intervening)
+        result = self._run(
+            handler(call_factory({**args, "confirm_token": preview["confirm_token"]}))
+        )
+
+        assert result["written"] is False, result
+        assert result["preview"] is True
+        assert result["confirm_token_mismatch"] is True
+        assert result["confirm_token"] != preview["confirm_token"]
+        assert cfg.read_text() == intervening
+        assert intervening_value in result["diff"]
+        hass.services.async_call.assert_not_called()
+
+        confirmed = self._run(
+            handler(call_factory({**args, "confirm_token": result["confirm_token"]}))
+        )
+        assert confirmed["written"] is True
+        data = make_yaml().load(cfg.read_text())
+        if action == "replace":
+            assert data["Test Theme"]["marker"] == "requested"
+        else:
+            assert "Test Theme" not in data
 
     def test_absent_flag_keeps_single_call_behavior(self, tmp_path, hass, call_factory):
         """Old servers never send require_confirm — writes stay one-call."""

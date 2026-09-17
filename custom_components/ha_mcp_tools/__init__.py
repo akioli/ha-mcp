@@ -10,6 +10,7 @@ import difflib
 import errno
 import fnmatch
 import hashlib
+import json
 import logging
 import os
 import posixpath
@@ -522,14 +523,11 @@ def _unified_diff(before: str, after: str, rel_path: str, max_lines: int = 200) 
     return "".join(lines)
 
 
-def _confirm_token(normalized: str, new_content: str) -> str:
-    """Stateless confirm token: hash of target path + exact bytes to write.
-
-    Re-derived on the confirm call from CURRENT disk state, so any change
-    to the file between preview and confirm invalidates the token
-    (optimistic locking, same philosophy as utils/config_hash.py).
-    """
-    return hashlib.sha256(f"{normalized}\n{new_content}".encode()).hexdigest()[:16]
+def _confirm_token(normalized: str, raw_content: str, new_content: str) -> str:
+    """Bind confirmation to the target, reviewed source, and proposed result."""
+    # Replacing/removing a key can hide source edits in the proposed result.
+    payload = json.dumps([normalized, raw_content, new_content])
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 def _count_reindented_lines(diff_text: str) -> int:
@@ -2086,6 +2084,7 @@ async def _serialize_and_validate_edit(
 def _maybe_build_confirm_preview(
     call: ServiceCall,
     normalized: str,
+    raw_content: str,
     new_content: str,
     rel_path: str,
     action: str,
@@ -2096,7 +2095,7 @@ def _maybe_build_confirm_preview(
     """Return a preview response when confirmation is required but unconfirmed."""
     require_confirm = bool(call.data.get("require_confirm", False))
     supplied_token = call.data.get("confirm_token")
-    expected_token = _confirm_token(normalized, new_content)
+    expected_token = _confirm_token(normalized, raw_content, new_content)
     if not (require_confirm and supplied_token != expected_token):
         return None
     preview: dict[str, Any] = {
@@ -2215,6 +2214,7 @@ async def _apply_yaml_key_edit(
         preview = _maybe_build_confirm_preview(
             call,
             normalized,
+            raw_content,
             new_content,
             rel_path,
             action,
