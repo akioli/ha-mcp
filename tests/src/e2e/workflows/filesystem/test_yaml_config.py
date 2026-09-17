@@ -16,6 +16,7 @@ These tests require:
 Tests are designed for the Docker Home Assistant test environment.
 """
 
+import asyncio
 import logging
 import os
 import uuid
@@ -1646,6 +1647,56 @@ class TestYamlConfirmFlow:
                 )
                 assert confirmed["written"] is True, confirmed
                 assert confirmed["config_check"] == "ok", confirmed
+        finally:
+            await safe_call_tool(
+                mcp_client_with_yaml_config,
+                "ha_delete_file",
+                {"path": fname, "confirm": True},
+            )
+            await safe_call_tool(
+                mcp_client_with_yaml_config, "ha_reload_core", {"target": "themes"}
+            )
+
+    async def test_concurrent_confirmations_preserve_both_updates(
+        self, mcp_client_with_yaml_config: Any
+    ) -> None:
+        fname = f"themes/confirm_parallel_{uuid.uuid4().hex[:8]}.yaml"
+        themes = ("First Probe", "Second Probe")
+        original = "First Probe: {marker: original}\nSecond Probe: {marker: original}\n"
+        try:
+            async with MCPAssertions(mcp_client_with_yaml_config) as mcp:
+                await mcp.call_tool_success(
+                    "ha_write_file", {"path": fname, "content": original}
+                )
+                requests = [
+                    {
+                        "file": fname,
+                        "yaml_path": theme,
+                        "action": "replace",
+                        "content": f"marker: update_{index}\n",
+                    }
+                    for index, theme in enumerate(themes)
+                ]
+                for args in requests:
+                    preview = await mcp.call_tool_success(TOOL_NAME, args)
+                    args["confirm_token"] = preview["confirm_token"]
+                results = await asyncio.gather(
+                    *(mcp.call_tool_success(TOOL_NAME, args) for args in requests)
+                )
+                assert sorted(result["written"] for result in results) == [
+                    False,
+                    True,
+                ], results
+                for args, result in zip(requests, results, strict=True):
+                    if not result["written"]:
+                        assert result["confirm_token_mismatch"] is True, result
+                        args["confirm_token"] = result["confirm_token"]
+                        done = await mcp.call_tool_success(TOOL_NAME, args)
+                        assert done["written"] is True, done
+                        assert done["config_check"] == "ok", done
+                current = await mcp.call_tool_success(READ_TOOL, {"path": fname})
+                assert "update_0" in current["content"], current
+                assert "update_1" in current["content"], current
         finally:
             await safe_call_tool(
                 mcp_client_with_yaml_config,
