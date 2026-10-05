@@ -400,6 +400,46 @@ class TestConfirmFlow:
         else:
             assert "Test Theme" not in data
 
+    @pytest.mark.parametrize("before,after", [("\n", "\r\n"), ("\r\n", "\n")])
+    def test_line_ending_change_invalidates_confirmation(
+        self,
+        tmp_path: Path,
+        hass: MagicMock,
+        call_factory: Callable[[dict[str, Any]], MagicMock],
+        before: str,
+        after: str,
+    ) -> None:
+        cfg = tmp_path / "themes" / "confirm.yaml"
+        cfg.parent.mkdir()
+        original = "Test Theme:\n  marker: unchanged\n"
+        cfg.write_bytes(original.replace("\n", before).encode())
+        args = {
+            "file": "themes/confirm.yaml",
+            "action": "replace",
+            "yaml_path": "Test Theme",
+            "content": "marker: requested\n",
+            "require_confirm": True,
+        }
+        handler = _build_edit_yaml_config_handler(hass)
+        preview = self._run(handler(call_factory(args)))
+        changed = original.replace("\n", after).encode()
+        cfg.write_bytes(changed)
+
+        stale = self._run(
+            handler(call_factory({**args, "confirm_token": preview["confirm_token"]}))
+        )
+
+        assert stale["written"] is False, stale
+        assert stale["confirm_token_mismatch"] is True
+        assert stale["confirm_token"] != preview["confirm_token"]
+        assert cfg.read_bytes() == changed
+        hass.services.async_call.assert_not_called()
+        confirmed = self._run(
+            handler(call_factory({**args, "confirm_token": stale["confirm_token"]}))
+        )
+        assert confirmed["written"] is True, confirmed
+        assert make_yaml().load(cfg.read_text())["Test Theme"]["marker"] == "requested"
+
     def test_absent_flag_keeps_single_call_behavior(self, tmp_path, hass, call_factory):
         """Old servers never send require_confirm — writes stay one-call."""
         cfg = Path(tmp_path) / "configuration.yaml"
