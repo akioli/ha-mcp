@@ -62,6 +62,12 @@ from .const import (
     YAML_KEY_DENYLIST,
     YAML_KEY_POST_ACTIONS,
 )
+from .file_writes import (
+    FileChangedDuringEditError,
+    atomic_replace_text,
+    await_file_write,
+    file_write_guard,
+)
 from .websocket_api import async_register_commands
 from .yaml_rt import (
     apply_seq_indent,
@@ -1453,16 +1459,16 @@ def _delete_file_sync(target_file: Path) -> dict[str, Any]:
     return {"size": stat.st_size}
 
 
-def _replace_file_sync(target_file: Path, content: str) -> dict[str, Any]:
+def _replace_file_sync(
+    target_file: Path, content: str, expected_content: str | None = None
+) -> dict[str, Any]:
     """Bundle whole-file replace I/O for a single executor offload.
 
     mkdir parent + atomic temp-write + rename + stat, mirroring
     ``_write_file_sync``. Used by edit_yaml_config(action="replace_file").
     """
     target_file.parent.mkdir(parents=True, exist_ok=True)
-    tmp_file = target_file.with_suffix(".tmp")
-    tmp_file.write_text(content)
-    os.replace(str(tmp_file), str(target_file))
+    atomic_replace_text(target_file, content, expected_content=expected_content)
     stat = target_file.stat()
     return {"size": stat.st_size, "mtime": stat.st_mtime}
 
@@ -1741,9 +1747,10 @@ async def _apply_replace_file(
         # Write the backup content verbatim (faithful restore). Bundles
         # mkdir + atomic temp-write+rename + stat into one offload, like
         # _write_file_sync.
-        write_meta = await hass.async_add_executor_job(
-            _replace_file_sync, target_file, content
-        )
+        async with file_write_guard(target_file, hass.async_add_executor_job):
+            write_meta = await await_file_write(
+                hass.async_add_executor_job(_replace_file_sync, target_file, content)
+            )
     except PermissionError:
         _LOGGER.error("Permission denied editing: %s", rel_path)
         return {
@@ -2183,91 +2190,85 @@ async def _apply_yaml_key_edit(
     target_file = config_dir / normalized
 
     try:
-        data, raw_content, load_err = await _load_edit_target_data(
-            hass, target_file, action, rel_path
-        )
-        if load_err is not None:
-            return load_err
+        async with file_write_guard(target_file, hass.async_add_executor_job):
+            data, raw_content, load_err = await _load_edit_target_data(
+                hass, target_file, action, rel_path
+            )
+            if load_err is not None:
+                return load_err
 
-        # Pre-write backups are captured MCP-side by ha-mcp's shared
-        # auto-backup layer (#1579): ha_config_set_yaml snapshots the
-        # prior key state before calling this service, so the edit is
-        # restorable via ha_manage_backup(scope="edits"). The component
-        # no longer writes its own .ha_mcp_tools_backups/ copy. (Pre-fix
-        # backups already on disk there stay readable; the separate
-        # GHSA-g39v-cvjh-8fpf startup migration is unaffected.)
+            # Pre-write backups are captured MCP-side by ha-mcp's shared
+            # auto-backup layer (#1579): ha_config_set_yaml snapshots the
+            # prior key state before calling this service, so the edit is
+            # restorable via ha_manage_backup(scope="edits"). The component
+            # no longer writes its own .ha_mcp_tools_backups/ copy. (Pre-fix
+            # backups already on disk there stay readable; the separate
+            # GHSA-g39v-cvjh-8fpf startup migration is unaffected.)
 
-        # Perform the action — branch on kind
-        apply_err = _apply_edit_action(
-            data, action, kind, path_parts, parsed_content, rel_path
-        )
-        if apply_err is not None:
-            return apply_err
+            # Perform the action — branch on kind
+            apply_err = _apply_edit_action(
+                data, action, kind, path_parts, parsed_content, rel_path
+            )
+            if apply_err is not None:
+                return apply_err
 
-        new_content, ser_err = await _serialize_and_validate_edit(
-            hass, data, raw_content
-        )
-        if ser_err is not None:
-            return ser_err
+            new_content, ser_err = await _serialize_and_validate_edit(
+                hass, data, raw_content
+            )
+            if ser_err is not None:
+                return ser_err
 
-        diff_text = _unified_diff(raw_content, new_content, rel_path)
-        reindent_count = _count_reindented_lines(diff_text)
+            diff_text = _unified_diff(raw_content, new_content, rel_path)
+            reindent_count = _count_reindented_lines(diff_text)
 
-        preview = _maybe_build_confirm_preview(
-            call,
-            normalized,
-            raw_content,
-            new_content,
-            rel_path,
-            action,
-            yaml_path,
-            diff_text,
-            reindent_count,
-        )
-        if preview is not None:
-            return preview
+            preview = _maybe_build_confirm_preview(
+                call,
+                normalized,
+                raw_content,
+                new_content,
+                rel_path,
+                action,
+                yaml_path,
+                diff_text,
+                reindent_count,
+            )
+            if preview is not None:
+                return preview
 
-        # Create parent directories if needed (for new package files).
-        # mkdir(exist_ok=True) is idempotent so no pre-check is required.
-        await hass.async_add_executor_job(
-            lambda: target_file.parent.mkdir(parents=True, exist_ok=True)
-        )
+            write_meta = await await_file_write(
+                hass.async_add_executor_job(
+                    _replace_file_sync, target_file, new_content, raw_content
+                )
+            )
+            modified_dt = datetime.fromtimestamp(write_meta["mtime"])
 
-        # Atomic write: write to temp file, then rename into place
-        def _atomic_write() -> None:
-            tmp_file = target_file.with_suffix(".tmp")
-            tmp_file.write_text(new_content)
-            os.replace(str(tmp_file), str(target_file))
+            _LOGGER.info(
+                "YAML config edited: %s (action=%s, key=%s)",
+                rel_path,
+                action,
+                yaml_path,
+            )
 
-        await hass.async_add_executor_job(_atomic_write)
+            result: dict[str, Any] = {
+                "success": True,
+                "file": rel_path,
+                "action": action,
+                "yaml_path": yaml_path,
+                "size": write_meta["size"],
+                "modified": modified_dt.isoformat(),
+                "written": True,
+                "diff": diff_text,
+            }
+            if reindent_count:
+                result["warnings"] = [_reindent_warning(reindent_count)]
 
-        stat = await hass.async_add_executor_job(target_file.stat)
-        modified_dt = datetime.fromtimestamp(stat.st_mtime)
+            # Surface the post-edit action required to activate the change
+            result.update(await _resolve_post_action(hass, kind, path_parts))
+            result.update(await _run_config_check(hass, rel_path))
+            return result
 
-        _LOGGER.info(
-            "YAML config edited: %s (action=%s, key=%s)",
-            rel_path,
-            action,
-            yaml_path,
-        )
-
-        result: dict[str, Any] = {
-            "success": True,
-            "file": rel_path,
-            "action": action,
-            "yaml_path": yaml_path,
-            "size": stat.st_size,
-            "modified": modified_dt.isoformat(),
-            "written": True,
-            "diff": diff_text,
-        }
-        if reindent_count:
-            result["warnings"] = [_reindent_warning(reindent_count)]
-
-        # Surface the post-edit action required to activate the change
-        result.update(await _resolve_post_action(hass, kind, path_parts))
-        result.update(await _run_config_check(hass, rel_path))
-        return result
+    except FileChangedDuringEditError as err:
+        return {"success": False, "written": False, "error": str(err)}
 
     except PermissionError:
         _LOGGER.error("Permission denied editing: %s", rel_path)
@@ -3006,14 +3007,17 @@ def _build_write_file_handler(
         target_file = config_dir / rel_path
 
         try:
-            result = await hass.async_add_executor_job(
-                _write_file_sync,
-                target_file,
-                content,
-                overwrite,
-                create_dirs,
-                config_dir,
-            )
+            async with file_write_guard(target_file, hass.async_add_executor_job):
+                result = await await_file_write(
+                    hass.async_add_executor_job(
+                        _write_file_sync,
+                        target_file,
+                        content,
+                        overwrite,
+                        create_dirs,
+                        config_dir,
+                    )
+                )
         except PermissionError:
             _LOGGER.error("Permission denied writing: %s", rel_path)
             return {
@@ -3083,7 +3087,10 @@ def _build_delete_file_handler(
         target_file = config_dir / rel_path
 
         try:
-            result = await hass.async_add_executor_job(_delete_file_sync, target_file)
+            async with file_write_guard(target_file, hass.async_add_executor_job):
+                result = await await_file_write(
+                    hass.async_add_executor_job(_delete_file_sync, target_file)
+                )
         except PermissionError:
             _LOGGER.error("Permission denied deleting: %s", rel_path)
             return {
