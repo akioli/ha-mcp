@@ -240,12 +240,17 @@ async def test_cancelled_write_keeps_lock_until_executor_finishes(
 
     hass.async_add_executor_job = execute
     handler = component._build_write_file_handler(hass)
-    args = {"path": "themes/shared.yaml", "content": "first", "overwrite": True}
     first = asyncio.create_task(first_handler(call_factory(first_args)))
     await started.wait()
     first.cancel()
     await asyncio.sleep(0)
-    second = asyncio.create_task(handler(call_factory({**args, "content": "second"})))
+    second = asyncio.create_task(
+        handler(
+            call_factory(
+                {"path": "themes/shared.yaml", "content": "second", "overwrite": True}
+            )
+        )
+    )
     try:
         first.cancel()  # Cleanup must withstand repeated cancellation too.
         await asyncio.sleep(0)
