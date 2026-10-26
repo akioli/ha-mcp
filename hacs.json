@@ -1,5 +1,6 @@
 {
-  "name": "HA-MCP Custom Component",
+  "name": "HA-MCP \u2014 Oliver\u2019s tested builds",
   "homeassistant": "2026.8.0",
-  "render_readme": true
+  "render_readme": true,
+  "hide_default_branch": true
 }
